@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Magical Hand Gestures</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+            font-family: sans-serif;
+        }
+        #canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2;
+        }
+        #video-container {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 320px;
+            height: 240px;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            z-index: 1;
+            transform: scaleX(-1); /* Mirror the video */
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .instruction {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 16px;
+            z-index: 5;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading">Loading AI Models...</div>
+    <div class="instruction">
+        ✊ <b>Fist</b>: Summon the Christmas Tree<br>
+        🖐 <b>Open Hand</b>: Reveal the Photo
+    </div>
+    
+    <!-- Fallback UI for File Loading -->
+    <div id="fallback-ui" style="display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 20; background: rgba(0,0,0,0.8); padding: 20px; border-radius: 10px; text-align: center; color: white; border: 1px solid white;">
+        <h3>Security Restriction Detected</h3>
+        <p>Browsers block reading local image files directly for security.</p>
+        <p>Please select <b>ANY number of images</b> to display!</p>
+        <p style="font-size: 0.8em; color: #aaa;">(They will cycle every time you open your hand)</p>
+        <input type="file" id="file-input" multiple accept="image/*" style="margin-top: 10px;">
+    </div>
+
+    <canvas id="canvas"></canvas>
+    <div id="video-container">
+        <video id="input_video"></video>
+    </div>
+
+    <script>
+        // --- Configuration ---
+        const PARTICLE_COUNT = 24000; // Reduced from 32k to 24k for 60FPS
+        const CANVAS_WIDTH = window.innerWidth;
+        const CANVAS_HEIGHT = window.innerHeight;
+        const FOCAL_LENGTH = 800; // For 3D projection
+        
+        // --- State ---
+        let particles = [];
+        let treeTargets = [];
+        let allPhotoTargets = []; // Store targets for all 4 images
+        let currentPhotoIndex = -1; // Start at -1 so first open sets it to 0
+        let currentMode = 'tree'; // 'tree' or 'photo'
+        let previousMode = 'tree'; // To detect state change
+        let isHandDetected = false;
+        let rotationAngle = 0; // For spinning the tree
+        let areImagesLoaded = false;
+
+        // --- Setup Canvas ---
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        canvas.width = CANVAS_WIDTH;
+        canvas.height = CANVAS_HEIGHT;
+
+        // --- Particle Class ---
+        class Particle {
+            constructor() {
+                // 3D coordinates centered at (0,0,0) conceptually
+                this.x = (Math.random() - 0.5) * CANVAS_WIDTH;
+                this.y = (Math.random() - 0.5) * CANVAS_HEIGHT;
+                this.z = Math.random() * 500;
+                
+                this.tx = this.x; // Target X
+                this.ty = this.y; // Target Y
+                this.tz = this.z; // Target Z
+                
+                this.color = 'white';
+                this.baseSize = 2.4; // Large enough to overlap and fill gaps
+                this.friction = 0.92;
+                this.ease = 0.08 + Math.random() * 0.05; // Slightly faster ease
+            }
+
+            update() {
+                // Determine target based on mode
+                let target;
+                if (currentMode === 'tree') {
+                    const tIndex = this.index % treeTargets.length;
+                    target = treeTargets[tIndex];
+                } else {
+                    // Photo mode
+                    if (areImagesLoaded && allPhotoTargets.length > 0) {
+                        // Ensure index is valid
+                        let idx = currentPhotoIndex;
+                        if (idx < 0) idx = 0;
+                        
+                        const currentTargets = allPhotoTargets[idx];
+                        if (currentTargets && currentTargets.length > 0) {
+                            const tIndex = this.index % currentTargets.length;
+                            target = currentTargets[tIndex];
+                        }
+                    }
+                }
+
+                if (target) {
+                    this.tx = target.x;
+                    this.ty = target.y;
+                    this.tz = target.z || 0;
+                    this.color = target.color;
+                } else if (currentMode === 'photo' && !areImagesLoaded) {
+                     // Fallback while loading
+                     this.tx = 0;
+                     this.ty = 0;
+                     this.tz = 0;
+                }
+
+                // Physics (Move in 3D space)
+                this.x += (this.tx - this.x) * this.ease;
+                this.y += (this.ty - this.y) * this.ease;
+                this.z += (this.tz - this.z) * this.ease;
+            }
+
+            draw() {
+                // Apply rotation only if in tree mode (or global spin)
+                let rx = this.x;
+                let rz = this.z;
+
+                if (currentMode === 'tree') {
+                    // Rotate around Y axis
+                    const cos = Math.cos(rotationAngle);
+                    const sin = Math.sin(rotationAngle);
+                    rx = this.x * cos - this.z * sin;
+                    rz = this.x * sin + this.z * cos;
+                }
+
+                // 3D Projection
+                // Perspective projection: scale = focalLength / (focalLength + z)
+                // We add an offset to Z to push it into the screen so we don't divide by zero
+                const scale = FOCAL_LENGTH / (FOCAL_LENGTH + rz + 200);
+                
+                const x2d = rx * scale + CANVAS_WIDTH / 2;
+                const y2d = this.y * scale + CANVAS_HEIGHT / 2;
+
+                // Scale size
+                const size = this.baseSize * scale;
+
+                if (size > 0.1) { // Only draw if visible
+                    ctx.fillStyle = this.color;
+                    // Optimization: Use fillRect and integer coordinates
+                    // (x2d | 0) truncates to integer, faster for CPU to rasterize
+                    ctx.fillRect((x2d | 0), (y2d | 0), size, size);
+                }
+            }
+        }
+
+        // --- Initialization ---
+        function initParticles() {
+            particles = [];
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const p = new Particle();
+                p.index = i;
+                particles.push(p);
+            }
+        }
+
+        // --- Target Generation: Tiered 3D Christmas Tree ---
+        function generateTreeTargets() {
+            treeTargets = [];
+            
+            // Tree Configuration
+            const tiers = 3;
+            const treeTotalHeight = CANVAS_HEIGHT * 0.9; // Increased from 0.75 for a taller tree
+            const tierHeight = treeTotalHeight / tiers;
+            const maxBaseRadius = CANVAS_WIDTH * 0.16; // Reduced from 0.22 for a slimmer, elegant look
+            const yStart = -treeTotalHeight / 2 - 50; // Shifted UP by decreasing Y start (was +30)
+            
+            // Distribute particles across tiers + Trunk
+            // Trunk gets ~7% of particles
+            const trunkCount = Math.floor(PARTICLE_COUNT * 0.07);
+            const foliageCount = PARTICLE_COUNT - trunkCount;
+            
+            // Area proportional to radius^2, but simplified logic: 20%, 35%, 45% of foliage
+            const tierCounts = [
+                Math.floor(foliageCount * 0.2), 
+                Math.floor(foliageCount * 0.35), 
+                foliageCount - Math.floor(foliageCount * 0.55)
+            ];
+
+            let pIndex = 0;
+
+            // --- Generate Foliage (Tiers) ---
+            for (let t = 0; t < tiers; t++) {
+                const count = tierCounts[t];
+                
+                // Radius settings for this tier
+                // Tier 0 (Top): 0 -> R1
+                // Tier 1 (Mid): R1*0.6 -> R2
+                // Tier 2 (Bot): R2*0.6 -> R3
+                
+                const tierTopY = yStart + t * tierHeight;
+                const tierBottomY = tierTopY + tierHeight;
+                
+                const tierMaxR = (t + 1) / tiers * maxBaseRadius;
+                // Increase min radius ratio for smoother connections (0.4 -> 0.5)
+                const tierMinR = t === 0 ? 0 : (tierMaxR * 0.5); 
+                
+                for (let i = 0; i < count; i++) {
+                    const h = Math.random(); // 0..1 within tier
+                    
+                    const y = tierTopY + h * tierHeight;
+                    
+                    // Curved interpolation for "Rounded" edges
+                    // Mix linear expansion with a sine bulge to make tiers look puffy/round
+                    const linearR = tierMinR + (tierMaxR - tierMinR) * h;
+                    const curve = Math.sin(h * Math.PI); // 0 at top/bottom, 1 in middle
+                    const bulge = (tierMaxR * 0.2) * curve; // 20% bulge
+                    
+                    // Add slight fuzz to soften the hard geometric edge
+                    const fuzz = (Math.random() - 0.5) * 8;
+                    
+                    const r = linearR + bulge + fuzz;
+                    
+                    const theta = Math.random() * Math.PI * 2;
+                    const x = r * Math.cos(theta);
+                    const z = r * Math.sin(theta);
+                    
+                    // Colors: Richer Green Palette (Forest to Lime)
+                    // Hue: 90 (Yellow-Green) to 160 (Teal-Green)
+                    // Saturation: 60-100% for vibrancy
+                    // Lightness: 20-60% for depth
+                    let color = `hsl(${90 + Math.random() * 70}, ${60 + Math.random() * 40}%, ${20 + Math.random() * 40}%)`;
+                    
+                    // Ornaments: Increased chance (20%) and Multi-colored
+                    if (Math.random() < 0.20) {
+                        const rand = Math.random();
+                        if (rand < 0.15) color = '#D4AF37'; // Gold
+                        else if (rand < 0.30) color = '#C21807'; // Red
+                        else if (rand < 0.45) color = '#E0FFFF'; // Ice Blue / White
+                        else if (rand < 0.60) color = '#FF1493'; // Deep Pink
+                        else if (rand < 0.75) color = '#1E90FF'; // Dodger Blue
+                        else if (rand < 0.90) color = '#9932CC'; // Dark Orchid (Purple)
+                        else color = '#FFA500'; // Orange
+                    }
+                    
+                    // Star (only in first tier, top particles)
+                    if (t === 0 && h < 0.1) {
+                        color = '#ffff00';
+                        treeTargets.push({ 
+                            x: (Math.random()-0.5)*10, 
+                            y: tierTopY - 10 - Math.random()*10, 
+                            z: (Math.random()-0.5)*10, 
+                            color 
+                        });
+                    } else {
+                        treeTargets.push({ x, y, z, color });
+                    }
+                    pIndex++;
+                }
+            }
+            
+            // --- Generate Trunk ---
+            const trunkHeight = treeTotalHeight * 0.25; // 25% of tree height (Longer)
+            const trunkRadius = maxBaseRadius * 0.15;   // Slightly thinner for proportion
+            const trunkTopY = yStart + treeTotalHeight; // Starts where foliage ends
+            
+            for (let i = 0; i < trunkCount; i++) {
+                const h = Math.random(); // 0..1
+                const y = trunkTopY + h * trunkHeight;
+                
+                // Cylinder shape
+                const r = Math.random() * trunkRadius;
+                const theta = Math.random() * Math.PI * 2;
+                
+                const x = r * Math.cos(theta);
+                const z = r * Math.sin(theta);
+                
+                // Brown Colors (Wood)
+                // HSL: 20-40 (Orange-Brown), Sat: 40-60%, Light: 20-40%
+                const color = `hsl(${25 + Math.random() * 15}, ${40 + Math.random() * 20}%, ${20 + Math.random() * 20}%)`;
+                
+                treeTargets.push({ x, y, z, color });
+            }
+            
+            // Fill remaining if rounding errors
+            while (treeTargets.length < PARTICLE_COUNT) {
+                 treeTargets.push(treeTargets[treeTargets.length-1]);
+            }
+        }
+
+        // --- Target Generation: Images (001-004) ---
+        function loadAllImages() {
+            const imageFiles = ['001.jpg', '002.jpg', '003.jpg', '004.jpg'];
+            let loadedCount = 0;
+
+            imageFiles.forEach((file, index) => {
+                const img = new Image();
+                img.src = file;
+                img.onload = () => {
+                    // Process image into targets
+                    const targets = processImageToTargets(img);
+                    allPhotoTargets[index] = targets;
+                    loadedCount++;
+                    
+                    if (loadedCount === imageFiles.length) {
+                        areImagesLoaded = true;
+                        console.log('All images loaded and processed');
+                        document.getElementById('loading').textContent = 'AI Ready';
+                    }
+                };
+                img.onerror = () => {
+                    console.error('Failed to load image:', file);
+                    // If we can't load the file (likely file:// protocol), show fallback
+                    showFallbackUI();
+                }
+            });
+        }
+
+        function processImageToTargets(img) {
+            const osc = document.createElement('canvas');
+            const osCtx = osc.getContext('2d');
+            
+            // Smart Grid Calculation
+            // We want total pixels ~= PARTICLE_COUNT
+            const aspect = img.width / img.height;
+            // h * (h * aspect) = count => h^2 = count / aspect
+            const h = Math.floor(Math.sqrt(PARTICLE_COUNT / aspect));
+            const w = Math.floor(h * aspect);
+            
+            osc.width = w;
+            osc.height = h;
+
+            osCtx.drawImage(img, 0, 0, w, h);
+
+            try {
+                const imageData = osCtx.getImageData(0, 0, w, h);
+                const data = imageData.data;
+
+                const validPixels = [];
+                // Scale factor to fit screen
+                const scaleFactor = 0.8;
+                const targetW = Math.min(CANVAS_WIDTH, CANVAS_HEIGHT) * scaleFactor;
+                const targetH = targetW / aspect; // Maintain aspect ratio in 3D space
+
+                // Scan every pixel because we resized to match particle count
+                for (let y = 0; y < h; y++) {
+                    for (let x = 0; x < w; x++) {
+                        const index = (y * w + x) * 4;
+                        const r = data[index];
+                        const g = data[index + 1];
+                        const b = data[index + 2];
+                        const a = data[index + 3]; // Alpha
+
+                        // Use brightness or alpha to decide if this is a valid pixel
+                        // Assuming jpgs might not have alpha, check for non-black or brightness
+                        const brightness = (r + g + b) / 3;
+                        
+                        // Lower threshold to capture dark areas too
+                        if (a > 128) {
+                            // Map 0..w to -w/2 .. w/2
+                            const px = (x / w - 0.5) * targetW;
+                            const py = (y / h - 0.5) * targetH;
+                            
+                            // Perfect Flatness
+                            const pz = 0;
+
+                            validPixels.push({
+                                x: px,
+                                y: py,
+                                z: pz,
+                                color: `rgb(${r},${g},${b})`
+                            });
+                        }
+                    }
+                }
+
+                // If we have more valid pixels than particles, we need to trim randomly
+                // If fewer, we can duplicate some or just leave them
+                // Shuffle is still good for the "forming" effect
+                validPixels.sort(() => Math.random() - 0.5);
+                
+                return validPixels;
+            } catch (e) {
+                console.warn("CORS/Security Error detected. Showing fallback UI.");
+                showFallbackUI();
+                return [];
+            }
+        }
+        
+        // --- Fallback UI Logic ---
+        function showFallbackUI() {
+            const ui = document.getElementById('fallback-ui');
+            const loading = document.getElementById('loading');
+            if (ui.style.display === 'none') {
+                ui.style.display = 'block';
+                loading.style.display = 'none'; // Hide loading text
+                
+                // Bind input
+                document.getElementById('file-input').addEventListener('change', handleFileSelect);
+            }
+        }
+
+        function handleFileSelect(evt) {
+            const files = Array.from(evt.target.files);
+            if (files.length === 0) return;
+
+            // Sort files by name to ensure consistent order
+            files.sort((a, b) => a.name.localeCompare(b.name));
+
+            // Dynamic: Accept ANY number of files
+            allPhotoTargets = []; 
+            let processedCount = 0;
+
+            files.forEach((file, index) => {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    const img = new Image();
+                    img.onload = function() {
+                        const targets = processImageToTargets(img);
+                        // Store in the correct sorted index
+                        allPhotoTargets[index] = targets;
+                        processedCount++;
+                        
+                        if (processedCount === files.length) {
+                            areImagesLoaded = true;
+                            // Filter out any potential undefined slots if errors occurred (rare)
+                            allPhotoTargets = allPhotoTargets.filter(t => t);
+                            
+                            document.getElementById('fallback-ui').style.display = 'none';
+                            console.log(`Manual load complete: ${allPhotoTargets.length} images ready`);
+                            
+                            // Visual feedback
+                            const loading = document.getElementById('loading');
+                            loading.style.display = 'block';
+                            loading.textContent = `Loaded ${allPhotoTargets.length} Photos!`;
+                            setTimeout(() => loading.style.display = 'none', 2000);
+                        }
+                    };
+                    img.src = e.target.result; // Data URI
+                };
+                reader.readAsDataURL(file);
+            });
+        }
+
+        // --- Animation Loop ---
+        function animate() {
+            // Clear completely to remove trails
+            ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            // Optional: Draw a black background if clearRect is transparent
+            // ctx.fillStyle = 'black';
+            // ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+            // Update Global Rotation
+            if (currentMode === 'tree') {
+                rotationAngle += 0.01;
+            } else {
+                // Slowly reset rotation or keep it fixed
+                rotationAngle = rotationAngle * 0.95;
+            }
+
+            // Sort particles by depth for painter's algorithm (approximate)
+            // Ideally we calculate projected z first, but for simple particles just drawing order helps
+            // Performance note: Sorting 3000 particles every frame is okay on modern devices
+            // but we can skip it if needed. Let's try without sort first for speed, 
+            // additive blending might look cool.
+            
+            // Actually, for solid particles, Z-sort is better.
+            // Let's optimize: map to a projection array, sort that, then draw.
+            // But simple iteration is often fine for small particles.
+            
+            particles.forEach(p => {
+                p.update();
+                p.draw();
+            });
+
+            requestAnimationFrame(animate);
+        }
+
+        // --- MediaPipe Hands Setup ---
+        const videoElement = document.getElementById('input_video');
+        
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                isHandDetected = true;
+                const landmarks = results.multiHandLandmarks[0];
+                
+                const wrist = landmarks[0];
+                const middleMcp = landmarks[9]; // Middle Finger Knuckle
+                
+                // Calculate scale (hand size) based on wrist to knuckle distance
+                const scale = Math.sqrt(Math.pow(middleMcp.x - wrist.x, 2) + Math.pow(middleMcp.y - wrist.y, 2));
+
+                const tips = [8, 12, 16, 20].map(i => landmarks[i]);
+                
+                // Calculate average distance from wrist to tips
+                let avgDist = 0;
+                tips.forEach(tip => {
+                    const d = Math.sqrt(Math.pow(tip.x - wrist.x, 2) + Math.pow(tip.y - wrist.y, 2));
+                    avgDist += d;
+                });
+                avgDist /= tips.length;
+
+                // Normalize distance by hand scale to be depth-invariant
+                const ratio = avgDist / (scale || 0.1); 
+
+                if (ratio < 1.3) {
+                    currentMode = 'tree';
+                } else if (ratio > 1.6) {
+                    currentMode = 'photo';
+                }
+
+                // State Machine for cycling images
+                if (previousMode === 'tree' && currentMode === 'photo') {
+                    // Transition detected: Fist -> Open
+                    if (areImagesLoaded) {
+                        currentPhotoIndex = (currentPhotoIndex + 1) % allPhotoTargets.length;
+                    }
+                }
+                previousMode = currentMode;
+            } else {
+                isHandDetected = false;
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        
+        hands.onResults(onResults);
+
+        let frameCounter = 0;
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                frameCounter++;
+                // Throttle AI: Run every 2nd frame (30 FPS detection)
+                // Increased from every 3rd frame for better responsiveness
+                if (frameCounter % 2 !== 0) return; 
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        
+        // --- Boot ---
+        window.addEventListener('load', () => {
+            initParticles();
+            generateTreeTargets();
+            loadAllImages(); // Load 001-004
+            camera.start();
+            animate();
+        });
+
+        // Handle resize
+        window.addEventListener('resize', () => {
+            // Need to reload everything on resize to keep center correct
+            // But we don't want to reload the page to avoid interrupting the camera
+            // Just re-init particles and targets
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            initParticles();
+            generateTreeTargets();
+            loadAllImages();
+        });
+
+    </script>
+</body>
+</html>
